@@ -12,12 +12,6 @@ import sys
 import ast
 import typing
 
-context = chapel.Context()
-asts = context.parse(sys.argv[1])
-text = context.get_file_text(sys.argv[1])
-text_lines = text.splitlines()
-max_line_length = max(len(line) for line in text_lines)
-
 # Implementation of exec_with_return from: https://stackoverflow.com/a/76636602
 def exec_with_return(code: str, globals: dict, locals: dict) -> typing.Any | None:
     a = ast.parse(code)
@@ -94,43 +88,50 @@ class SyntaxWithUnderline(Syntax):
 class AstExplorer(App):
     def __init__(self):
         super().__init__()
+
+        # Stuff to do with the file we're processing.
+        self.context = chapel.Context()
+        self.context.set_module_paths([], [])
+        self.file = sys.argv[1]
+        self.load_file()
+
+        # Interactive state.
         self.selected_ast = None
         self.history = []
         self.env = {}
         self.repl_globals = globals().copy()
         self.tree_nodes_for_ast = {}
 
+        # Configure some REPL commands.
+        self.repl_globals['print'] = lambda *args: self.print(*args)
         self.repl_globals['select'] = lambda node: self.select_node(node)
+        self.repl_globals['reparse'] = lambda: self.reparse()
 
-    def compose(self) -> ComposeResult:
-        yield Header()
-        self.mytree = Tree("Chapel AST")
-        for ast in asts:
-            self.build_ast(ast, self.mytree.root)
+    def load_file(self):
+        self.asts = self.context.parse(self.file)
+        self.text = self.context.get_file_text(self.file)
+        self.text_lines = self.text.splitlines()
+        self.max_line_length = max(len(line) for line in self.text_lines)
 
-        log = RichLog(highlight=True, markup=False, min_width=max_line_length + 1)
-        log.auto_scroll = False
-        yield Horizontal(self.mytree, log)
-        yield Log()
-        yield Input()
+    def populate_tree_with_asts(self, ast, add_to):
+        for child in ast:
+            self.populate_tree_with_ast(child, add_to)
 
-    def on_ready(self):
-        text_log = self.query_one(RichLog)
-        text_log.write(Syntax(text, "chapel", indent_guides=True))
+    def populate_tree_with_ast(self, ast, add_to):
+        label = ast.tag()
+        children = list(ast)
+        my_node = add_to.add(label, data=ast) if len(children) > 0 else add_to.add_leaf(label, data=ast)
+        self.tree_nodes_for_ast[ast.unique_id()] = my_node
 
-        repl_log = self.query_one(Log)
-        self.repl_globals['print'] = lambda *args: repl_log.write_line(" ".join(map(str, args)))
-
-    def on_tree_node_selected(self, node_selected):
-        ast = node_selected.node.data
-        if ast is None:
-            return
-        self.show_ast(ast)
+        for child in children:
+            self.populate_tree_with_ast(child, my_node)
 
     def show_ast(self, ast):
         self.selected_ast = ast
-
-        text_log = self.query_one(RichLog)
+        if ast is None:
+            self.codelog.clear()
+            self.codelog.write(Syntax(self.text, "chapel", indent_guides=True))
+            return
 
         loc = ast.location()
         first_line, first_col = loc.start()
@@ -141,15 +142,34 @@ class AstExplorer(App):
         # Underline location, relative to first line and column.
         underline_loc = ((0, first_col - 1), (last_line - first_line, last_col - 1))
 
-        lines_before = text_lines[:first_line-1]
-        lines_selected = text_lines[first_line-1:last_line]
-        lines_after = text_lines[last_line:]
-        text_log.clear()
-        text_log.write(Syntax("\n".join(lines_before), "text", indent_guides=True))
-        text_log.write(SyntaxWithUnderline(underline_loc, "\n".join(lines_selected), "chapel", indent_guides=True))
-        text_log.write(Syntax("\n".join(lines_after), "text", indent_guides=True))
+        lines_before = self.text_lines[:first_line-1]
+        lines_selected = self.text_lines[first_line-1:last_line]
+        lines_after = self.text_lines[last_line:]
+        self.codelog.clear()
+        self.codelog.write(Syntax("\n".join(lines_before), "text", indent_guides=True))
+        self.codelog.write(SyntaxWithUnderline(underline_loc, "\n".join(lines_selected), "chapel", indent_guides=True))
+        self.codelog.write(Syntax("\n".join(lines_after), "text", indent_guides=True))
 
-        text_log.scroll_to(x = 0, y = max(0, first_line - 1. - 5))
+        self.codelog.scroll_to(x = 0, y = max(0, first_line - 1. - 5))
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        self.mytree = Tree("Chapel AST")
+        self.populate_tree_with_asts(self.asts, self.mytree.root)
+
+        self.codelog = RichLog(highlight=True, markup=False, min_width=self.max_line_length + 1)
+        self.codelog.auto_scroll = False
+        yield Horizontal(self.mytree, self.codelog)
+
+        self.repllog = Log()
+        yield self.repllog
+        yield Input()
+
+    def on_ready(self):
+        self.show_ast(None)
+
+    def on_tree_node_selected(self, node_selected):
+        self.show_ast(node_selected.node.data)
 
     @on(Input.Submitted)
     def on_input_submitted(self, changed: Input.Submitted):
@@ -169,14 +189,8 @@ class AstExplorer(App):
             log.write_line(str(e))
         changed.input.clear()
 
-    def build_ast(self, ast, add_to):
-        label = ast.tag()
-        children = list(ast)
-        my_node = add_to.add(label, data=ast) if len(children) > 0 else add_to.add_leaf(label, data=ast)
-        self.tree_nodes_for_ast[ast.unique_id()] = my_node
-
-        for child in children:
-            self.build_ast(child, my_node)
+    def print(self, *args):
+        self.repllog.write_line(" ".join(map(str, args)))
 
     def select_node(self, ast):
         if self.tree is None:
@@ -184,6 +198,14 @@ class AstExplorer(App):
         tree_node = self.tree_nodes_for_ast[ast.unique_id()]
         self.mytree.select_node(tree_node)
         self.show_ast(ast)
+
+    def reparse(self):
+        self.context.advance_to_next_revision(False)
+        self.load_file()
+        self.mytree.root.remove_children()
+        self.populate_tree_with_asts(self.asts, self.mytree.root)
+        self.show_ast(None)
+
 
 if __name__ == "__main__":
     app = AstExplorer()
